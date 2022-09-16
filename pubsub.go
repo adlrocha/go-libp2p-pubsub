@@ -1307,10 +1307,89 @@ func (p *PubSub) Publish(topic string, data []byte, opts ...PubOpt) error {
 	return t.Publish(context.TODO(), data, opts...)
 }
 
+// PublishToPeer forges the publication of a GossipSub message to a specific peer to make it
+// think as if it was broadcast to all nodes in the network.
+// It also uses the current sequence number of the signer to make it seem as valid message.
+func (p *PubSub) PublishToPeer(topic string, data []byte, pids []peer.ID, opts ...PubOpt) error {
+	// try to join if we are not part of the topic.
+	t, _, err := p.tryJoin(topic)
+	if err != nil {
+		return err
+	}
+
+	// Preamble to get the message ready with signature, ids, etc.
+	t.mux.RLock()
+	defer t.mux.RUnlock()
+	if t.closed {
+		return ErrTopicClosed
+	}
+
+	pid := t.p.signID
+	key := t.p.signKey
+
+	pub := &PublishOptions{}
+	for _, opt := range opts {
+		err := opt(pub)
+		if err != nil {
+			return err
+		}
+	}
+
+	if pub.customKey != nil {
+		key, pid = pub.customKey()
+		if key == nil {
+			return ErrNilSignKey
+		}
+		if len(pid) == 0 {
+			return ErrEmptyPeerID
+		}
+	}
+
+	m := &pb.Message{
+		Data:  data,
+		Topic: &t.topic,
+		From:  nil,
+		Seqno: nil,
+	}
+	if pid != "" {
+		m.From = []byte(pid)
+		// Using the current sequence number without increasing
+		// the counter to the subsequent number (we want those
+		// sequence numbers to be valid for the actual messages
+		// that we want to broadcast successfully).
+		// m.Seqno = t.p.nextSeqno()
+		m.Seqno = t.p.currSeqno()
+	}
+	if key != nil {
+		m.From = []byte(pid)
+		err := signMessage(pid, key, m)
+		if err != nil {
+			return err
+		}
+	}
+	gs, ok := p.rt.(*GossipSubRouter)
+	if !ok {
+		return fmt.Errorf("router has wrong type. Direct publish only supported for gossipsub")
+	}
+	out := rpcWithMessages(m)
+	for _, pid := range pids {
+		gs.sendRPC(pid, out)
+	}
+	return nil
+
+}
+
 func (p *PubSub) nextSeqno() []byte {
 	seqno := make([]byte, 8)
 	counter := atomic.AddUint64(&p.counter, 1)
 	binary.BigEndian.PutUint64(seqno, counter)
+	return seqno
+}
+
+func (p *PubSub) currSeqno() []byte {
+	seqno := make([]byte, 8)
+	// counter := atomic.AddUint64(&p.counter, 0)
+	binary.BigEndian.PutUint64(seqno, p.counter+1)
 	return seqno
 }
 
